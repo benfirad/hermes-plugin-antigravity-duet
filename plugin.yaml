@@ -1,0 +1,24 @@
+name: antigravity-duet
+version: "0.1.0"
+description: "Autonomous background task queue (Claude Duet-style worker) with Human-in-the-Loop approval gates and multi-model Antigravity CLI quota fallback for Hermes Agent."
+author: "benfirad"
+license: "MIT"
+homepage: "https://github.com/benfirad/hermes-plugin-antigravity-duet"
+requires_hermes: ">=0.21.0"
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - duet_queue
+provides_hooks: []
+requires_env: []
+config_schema:
+  bridge_port:
+    type: int
+    required: false
+  dashboard_port:
+    type: int
+    required: false
+  agy_bin:
+    type: str
+    required: false
