@@ -17,9 +17,10 @@ Autonomous **Duet / Duffy ("Do-For-You") background task queue** (`duet_queue` t
    - Routes inference through the official Google Antigravity CLI (`agy`) across the subscription model pool (`gemini-3.8-flash-high` → `claude-sonnet-5-5-high` → `gemini-3.8-flash-medium` → `gemini-3.1-pro-high` → `claude-opus-5-5-high` → `gpt-oss-120b-medium`).
    - Automatically falls over to the next available model when an individual model hits a rate or quota limit (`RESOURCE_EXHAUSTED` / `Individual quota reached`).
 
-4. **Optional Local OpenAI-Compatible Bridge & Web Dashboard:**
+4. **Optional Local OpenAI-Compatible Bridge, Direct Agent Chat & macOS Companion App:**
    - Run `python3 -m duet_engine bridge` to expose `http://127.0.0.1:8765/v1` for zero-API-cost `custom` provider routing.
-   - Run `python3 -m duet_engine worker` to process queued Duet/Duffy tasks in the background and serve the local status/approval dashboard on `http://127.0.0.1:8899`.
+   - Run `python3 -m duet_engine worker` to process queued Duet/Duffy tasks in the background, support direct specialist agent chat (`POST /chat`), and serve the local status/approval dashboard on `http://127.0.0.1:8899`.
+   - Includes a minimal native macOS companion source (`macos-companion/DAAKDuffyCompanionApp.swift`) with a character roster + direct agent chat view and an `OS` detailed queue/terminal command window.
 
 ## Installation
 

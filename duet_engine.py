@@ -178,7 +178,41 @@ class DuetQueueStore:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS duet_chats (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_id TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    created_at TEXT
+                )
+                """
+            )
             conn.commit()
+        finally:
+            conn.close()
+
+    def add_chat(self, agent_id: str, sender: str, message: str) -> int:
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "INSERT INTO duet_chats (agent_id, sender, message, created_at) VALUES (?, ?, ?, ?)",
+                (agent_id, sender, message, _now_str()),
+            )
+            cid = int(cur.lastrowid or 0)
+            conn.commit()
+            return cid
+        finally:
+            conn.close()
+
+    def list_chats(self, limit: int = 200) -> List[Dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM duet_chats ORDER BY id ASC LIMIT ?", (int(limit),)
+            ).fetchall()
+            return [dict(r) for r in rows]
         finally:
             conn.close()
 
@@ -546,7 +580,8 @@ class DuetDashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path.startswith("/api/status"):
             tasks = self.store.list_tasks(limit=30)
-            raw = json.dumps({"status": "ok", "tasks": tasks}, ensure_ascii=False).encode("utf-8")
+            chats = self.store.list_chats(limit=200)
+            raw = json.dumps({"status": "ok", "tasks": tasks, "chats": chats}, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
@@ -612,7 +647,37 @@ class DuetDashboardHandler(BaseHTTPRequestHandler):
         elif self.path == "/reject":
             tid = int(params.get("id", ["0"])[0])
             self.store.set_status(tid, "rejected", "Rejected via Web Dashboard.")
+        elif self.path == "/chat":
+            agent_id = (params.get("agent_id", ["duffy"])[0]).strip()
+            msg = (params.get("message", [""])[0]).strip()
+            if msg:
+                self.store.add_chat(agent_id, "user", msg)
+                threading.Thread(
+                    target=_handle_public_agent_chat,
+                    args=(self.store, agent_id, msg),
+                    daemon=True,
+                ).start()
+            raw_json = json.dumps({"status": "queued"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw_json)))
+            self.end_headers()
+            self.wfile.write(raw_json)
+            return
         self._redirect("/")
+
+
+def _handle_public_agent_chat(store: DuetQueueStore, agent_id: str, user_msg: str) -> None:
+    try:
+        prompt = (
+            f"You are specialist agent '{agent_id}' inside the Hermes Antigravity Duet system.\n"
+            f"User message: {user_msg}\n\n"
+            f"Respond concisely and helpfully."
+        )
+        reply, _ = run_agy_with_fallback(prompt=prompt)
+        store.add_chat(agent_id, "agent", reply.strip())
+    except Exception as exc:
+        store.add_chat(agent_id, "agent", f"Error generating response: {exc}")
 
 
 def process_next_task(store: DuetQueueStore, agy_bin: Optional[str] = None) -> bool:
