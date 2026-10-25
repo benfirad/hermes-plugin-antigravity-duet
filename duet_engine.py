@@ -79,6 +79,49 @@ def resolve_agy_bin(custom_bin: Optional[str] = None) -> str:
     return "agy"
 
 
+def resolve_ruflo_bin(custom_bin: Optional[str] = None) -> str:
+    if custom_bin:
+        return custom_bin
+    found = shutil.which("ruflo")
+    if found:
+        return found
+    candidate = Path.home() / ".local" / "bin" / "ruflo"
+    if candidate.is_file():
+        return str(candidate)
+    return "ruflo"
+
+
+def run_ruflo_command(
+    sub_args: List[str],
+    ruflo_bin: Optional[str] = None,
+    working_dir: Optional[Path] = None,
+    timeout_sec: int = 60,
+) -> Dict[str, Any]:
+    """Execute a sanitized Ruflo multi-agent / swarm command (status, list, spawn, stop, init)."""
+    binary = resolve_ruflo_bin(ruflo_bin)
+    cwd = str(working_dir or resolve_hermes_home())
+    cmd = [binary] + [str(a) for a in sub_args]
+    try:
+        res = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+        )
+        out = (res.stdout or "").strip()
+        err = (res.stderr or "").strip()
+        return {
+            "ok": res.returncode == 0,
+            "exit_code": res.returncode,
+            "stdout": out,
+            "stderr": err,
+        }
+    except Exception as exc:
+        return {"ok": False, "exit_code": -1, "error": str(exc)}
+
+
+
 def resolve_model_id(name: Optional[str]) -> str:
     if not name:
         return DEFAULT_FALLBACK_MODELS[0]

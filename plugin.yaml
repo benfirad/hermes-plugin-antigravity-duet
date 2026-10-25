@@ -1,6 +1,6 @@
 name: antigravity-duet
-version: "0.1.0"
-description: "Autonomous background task queue (Claude Duet-style worker) with Human-in-the-Loop approval gates and multi-model Antigravity CLI quota fallback for Hermes Agent."
+version: "0.2.0"
+description: "Autonomous background task queue (Duet / Duffy Do-For-You worker) with Human-in-the-Loop approval gates, Ruflo multi-agent swarm orchestration, and multi-model Antigravity CLI quota fallback for Hermes Agent."
 author: "benfirad"
 license: "MIT"
 homepage: "https://github.com/benfirad/hermes-plugin-antigravity-duet"
@@ -10,6 +10,7 @@ platforms:
   - macos
 provides_tools:
   - duet_queue
+  - ruflo_swarm
 provides_hooks: []
 requires_env: []
 config_schema:
@@ -22,3 +23,7 @@ config_schema:
   agy_bin:
     type: str
     required: false
+  ruflo_bin:
+    type: str
+    required: false
+
