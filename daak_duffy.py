@@ -70,14 +70,19 @@ def resolve_hermes_home() -> Path:
 
 def resolve_duet_dir() -> Path:
     """
-    Store plugin data under $HERMES_HOME/plugin-data/antigravity-duet/
-    with backwards compatibility if legacy $HERMES_HOME/duet/duet.db exists.
+    Store plugin data under $HERMES_HOME/plugin-data/daak-duffy/
+    with backwards compatibility for antigravity-duet and legacy $HERMES_HOME/duet/.
     """
-    plugin_data = resolve_hermes_home() / "plugin-data" / "antigravity-duet"
+    duffy_dir = resolve_hermes_home() / "plugin-data" / "daak-duffy"
+    antigravity_dir = resolve_hermes_home() / "plugin-data" / "antigravity-duet"
     legacy_dir = resolve_hermes_home() / "duet"
-    if not (plugin_data / "duet.db").is_file() and (legacy_dir / "duet.db").is_file():
+    if duffy_dir.is_dir() or (duffy_dir / "duet.db").is_file():
+        return duffy_dir
+    if (antigravity_dir / "duet.db").is_file():
+        return antigravity_dir
+    if (legacy_dir / "duet.db").is_file():
         return legacy_dir
-    return plugin_data
+    return duffy_dir
 
 
 def resolve_agy_bin(custom_bin: Optional[str] = None) -> str:

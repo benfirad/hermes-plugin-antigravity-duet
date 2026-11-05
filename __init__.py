@@ -1,5 +1,5 @@
 """
-antigravity-duet — Autonomous background task queue (Duet / Duffy Do-For-You worker)
+daak-duffy — Autonomous background task queue (DAAK Duffy 🦆 Do-For-You worker)
 with Human-in-the-Loop approval gates, Ruflo multi-agent swarm orchestration,
 and multi-model Antigravity CLI quota fallback.
 
