@@ -15,9 +15,12 @@ import json
 from typing import Any, Dict, List, Optional
 
 try:
-    from .duet_engine import DuetQueueStore, run_ruflo_command
+    from .daak_duffy import DuetQueueStore, run_ruflo_command
 except (ImportError, ValueError):
-    from duet_engine import DuetQueueStore, run_ruflo_command
+    try:
+        from daak_duffy import DuetQueueStore, run_ruflo_command
+    except (ImportError, ValueError):
+        from .duet_engine import DuetQueueStore, run_ruflo_command
 
 _DUET_TOOL_SCHEMA: Dict[str, Any] = {
     "name": "duet_queue",

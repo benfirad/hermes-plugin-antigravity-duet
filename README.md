@@ -21,8 +21,8 @@ Autonomous **Duet / Duffy ("Do-For-You") background task queue** (`duet_queue` t
    - Automatically falls over to the next available model when an individual model hits quota limits (`RESOURCE_EXHAUSTED` / `Individual quota reached`).
    - Worker runs in confined mode with `--no-tools` to ensure safe headless execution.
 
-4. **Token-Authenticated Local Web Dashboard & Worker:**
-   - Start the standalone background worker & web UI: `python3 -m duet_engine worker`.
+4. **Token-Authenticated Local Web Dashboard & DAAK Duffy Worker:**
+   - Start the standalone background worker & web UI: `python3 -m daak_duffy worker` (or `python3 -m duet_engine worker`).
    - **Host & CSRF Locked:** Enforces `127.0.0.1` / `localhost` Host validation and strict Origin checks.
    - **Launch Token Security:** Every run generates a cryptographically random token stored with `0600` permissions under `$HERMES_HOME/plugin-data/antigravity-duet/.dashboard_token`, required on all GET/POST requests.
    - Includes a native macOS companion source (`macos-companion/DAAKDuffyCompanionApp.swift`) for operator roster and queue monitoring.
