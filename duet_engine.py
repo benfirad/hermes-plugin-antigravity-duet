@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Sanitized, generic Duet Queue Store, Multi-Model Antigravity CLI Fallback,
-and Secure Human-in-the-Loop Web Dashboard for Hermes Agent.
+Sanitized, generic Duet Queue Store, Multi-Model Antigravity CLI Worker,
+and Token-Authenticated Human-in-the-Loop Web Dashboard for Hermes Agent.
 
 Contains zero personal data, hardcoded paths, or third-party credentials.
-All state is stored inside `$HERMES_HOME/plugin-data/antigravity-duet/`.
+All state is stored inside `$HERMES_HOME/plugin-data/antigravity-duet/`
+(default `~/.hermes/plugin-data/antigravity-duet/`).
 """
 
 from __future__ import annotations
@@ -61,21 +62,22 @@ def _now_str() -> str:
 
 
 def resolve_hermes_home() -> Path:
-    try:
-        from hermes_constants import get_hermes_home
-        return Path(get_hermes_home()).resolve()
-    except Exception:
-        pass
     env_home = os.environ.get("HERMES_HOME")
     if env_home:
         return Path(env_home).expanduser().resolve()
     return (Path.home() / ".hermes").resolve()
 
 
-def get_plugin_data_dir() -> Path:
-    base = resolve_hermes_home() / "plugin-data" / "antigravity-duet"
-    base.mkdir(parents=True, exist_ok=True)
-    return base
+def resolve_duet_dir() -> Path:
+    """
+    Store plugin data under $HERMES_HOME/plugin-data/antigravity-duet/
+    with backwards compatibility if legacy $HERMES_HOME/duet/duet.db exists.
+    """
+    plugin_data = resolve_hermes_home() / "plugin-data" / "antigravity-duet"
+    legacy_dir = resolve_hermes_home() / "duet"
+    if not (plugin_data / "duet.db").is_file() and (legacy_dir / "duet.db").is_file():
+        return legacy_dir
+    return plugin_data
 
 
 def resolve_agy_bin(custom_bin: Optional[str] = None) -> str:
@@ -108,15 +110,14 @@ def run_ruflo_command(
     working_dir: Optional[Path] = None,
     timeout_sec: int = 60,
 ) -> Dict[str, Any]:
-    """Execute a sanitized Ruflo command inside the plugin data directory."""
+    """Execute a sanitized Ruflo multi-agent / swarm command inside the isolated plugin data directory."""
     binary = resolve_ruflo_bin(ruflo_bin)
-    ruflo_cwd = working_dir or (get_plugin_data_dir() / "ruflo")
-    ruflo_cwd.mkdir(parents=True, exist_ok=True)
+    cwd = str(working_dir or resolve_duet_dir())
     cmd = [binary] + [str(a) for a in sub_args]
     try:
         res = subprocess.run(
             cmd,
-            cwd=str(ruflo_cwd),
+            cwd=cwd,
             capture_output=True,
             text=True,
             timeout=timeout_sec,
@@ -142,14 +143,32 @@ def resolve_model_id(name: Optional[str]) -> str:
     return MODEL_ALIASES.get(cleaned, DEFAULT_FALLBACK_MODELS[0])
 
 
+def get_or_create_dashboard_token(base_dir: Path) -> str:
+    """
+    Generates a cryptographically secure random token per launch,
+    persisted with 0600 permissions in the plugin data folder.
+    """
+    base_dir.mkdir(parents=True, exist_ok=True)
+    token_file = base_dir / ".dashboard_token"
+    token = secrets.token_hex(24)
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(str(token_file), flags, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(token)
+    except Exception:
+        pass
+    return token
+
+
 class DuetQueueStore:
     """SQLite-backed persistent queue for autonomous Duet tasks and Human-in-the-Loop approvals."""
 
     def __init__(self, base_dir: Optional[Path] = None) -> None:
-        self.base_dir = base_dir or get_plugin_data_dir()
+        self.base_dir = base_dir or resolve_duet_dir()
         self.db_path = self.base_dir / "duet.db"
         self.workspaces_dir = self.base_dir / "workspaces"
-        self.token_file = self.base_dir / "dashboard_token.txt"
+        self.token = get_or_create_dashboard_token(self.base_dir)
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -169,7 +188,7 @@ class DuetQueueStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
                     category TEXT DEFAULT 'general',
-                    status TEXT DEFAULT 'awaiting_approval',
+                    status TEXT DEFAULT 'pending',
                     model_used TEXT,
                     result_summary TEXT,
                     approval_action TEXT,
@@ -243,7 +262,8 @@ class DuetQueueStore:
         self,
         title: str,
         category: str = "general",
-        status: str = "awaiting_approval",
+        status: str = "pending",
+        log_note: Optional[str] = None,
     ) -> int:
         ts = _now_str()
         conn = self._connect()
@@ -259,7 +279,8 @@ class DuetQueueStore:
             conn.commit()
         finally:
             conn.close()
-        self.add_log(tid, f"Task added to queue (category={category}, status={status}).")
+        note = log_note or f"Task added to queue (category={category}, status={status})."
+        self.add_log(tid, note)
         return tid
 
     def list_tasks(self, limit: int = 20) -> List[Dict[str, Any]]:
@@ -313,15 +334,17 @@ def run_agy_with_fallback(
     agy_bin: Optional[str] = None,
     working_dir: Optional[Path] = None,
     timeout_sec: int = 180,
+    confined: bool = True,
 ) -> Tuple[str, str]:
     """
-    Invoke the official Antigravity CLI (`agy`) in print mode (`-p`) with tools confined (`--no-tools`),
+    Invoke the official Antigravity CLI (`agy`) in print mode (`-p`),
     automatically falling back across the subscription model pool on quota exhaustion.
+    Tasks are executed with tools confined/disabled when running in autonomous worker mode.
     """
     binary = resolve_agy_bin(agy_bin)
     primary = resolve_model_id(preferred_model)
     candidates = [primary] + [m for m in DEFAULT_FALLBACK_MODELS if m != primary]
-    cwd = str(working_dir or get_plugin_data_dir())
+    cwd = str(working_dir or resolve_duet_dir())
 
     last_err = ""
     for candidate in candidates:
@@ -329,13 +352,14 @@ def run_agy_with_fallback(
             binary,
             "--model",
             candidate,
-            "--no-tools",
             "--disable-slash-commands",
             "--print-timeout",
             f"{timeout_sec}s",
-            "-p",
-            prompt,
         ]
+        if confined:
+            cmd.append("--no-tools")
+        cmd.extend(["-p", prompt])
+
         try:
             res = subprocess.run(
                 cmd,
@@ -358,24 +382,6 @@ def run_agy_with_fallback(
             last_err = str(exc)
 
     raise RuntimeError(last_err or "All fallback models in Antigravity CLI pool failed.")
-
-
-def get_or_generate_launch_token(data_dir: Path) -> str:
-    """Generate a random auth token per launch, stored with permissions 0600 in plugin-data."""
-    data_dir.mkdir(parents=True, exist_ok=True)
-    token = secrets.token_urlsafe(32)
-    token_file = data_dir / "dashboard_token.txt"
-    try:
-        fd = os.open(str(token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with open(fd, "w") as f:
-            f.write(token)
-    except Exception:
-        token_file.write_text(token)
-        try:
-            os.chmod(str(token_file), 0o600)
-        except Exception:
-            pass
-    return token
 
 
 # =============================================================================
@@ -411,6 +417,11 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
     border: 1px solid var(--green); padding: 5px 12px; border-radius: 999px;
     font-size: 13px; font-weight: 600;
   }
+  .auth-badge {
+    background: rgba(56,189,248,0.15); color: var(--accent);
+    border: 1px solid var(--accent); padding: 5px 12px; border-radius: 999px;
+    font-size: 13px; font-weight: 600;
+  }
   .new-box, .task-card {
     background: var(--card); border: 1px solid var(--border);
     border-radius: 12px; padding: 16px; margin-bottom: 16px;
@@ -431,6 +442,11 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   .status-pill {
     padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 700; text-transform: uppercase;
   }
+  .st-awaiting_approval { background: rgba(245,158,11,0.25); color: var(--amber); border: 1px solid var(--amber); }
+  .st-pending { background: rgba(148,163,184,0.2); color: var(--muted); }
+  .st-running { background: rgba(56,189,248,0.2); color: var(--accent); }
+  .st-done { background: rgba(34,197,94,0.2); color: var(--green); }
+  .st-failed, .st-rejected { background: rgba(239,68,68,0.2); color: var(--red); }
   .meta { font-size: 12px; color: var(--muted); }
   pre {
     background: #090d14; padding: 12px; border-radius: 8px; border: 1px solid #1e293b;
@@ -443,13 +459,16 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   <header>
     <div>
       <h2 style="margin:0;">Hermes Antigravity Duet</h2>
-      <div class="meta">Autonomous Background Queue • Human-in-the-Loop Approval Gate • Ruflo Swarm Controller</div>
+      <div class="meta">Autonomous Background Queue • Multi-Model Quota Fallback • Human-in-the-Loop Safety</div>
     </div>
-    <span class="badge">Authenticated Session</span>
+    <div style="display:flex; gap:8px;">
+      <span class="auth-badge">Host & Token Protected</span>
+      <span class="badge">Multi-Model Pool</span>
+    </div>
   </header>
   <div class="new-box">
     <form class="new-form" method="POST" action="/add">
-      <input type="hidden" name="token" value="__AUTH_TOKEN__">
+      <input type="hidden" name="token" value="__TOKEN__">
       <select name="category">
         <option value="general">General</option>
         <option value="research">Research</option>
@@ -457,7 +476,7 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         <option value="ops">Ops</option>
       </select>
       <input type="text" name="title" placeholder="Describe an autonomous background task..." required>
-      <button type="submit" class="btn-primary">+ Enqueue Task (Approved)</button>
+      <button type="submit" class="btn-primary">+ Enqueue Task</button>
     </form>
   </div>
   __TASKS_HTML__
@@ -468,91 +487,100 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 class DuetDashboardHandler(BaseHTTPRequestHandler):
     store: DuetQueueStore
-    auth_token: str
     server_port: int = 8899
-    server_host: str = "127.0.0.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         pass
 
-    def _is_valid_host(self) -> bool:
-        host = (self.headers.get("Host") or "").strip().lower()
-        valid = {
-            f"127.0.0.1:{self.server_port}",
-            f"localhost:{self.server_port}",
-            "127.0.0.1",
-            "localhost",
-        }
-        return host in valid
+    def _validate_host(self) -> bool:
+        """Refuses requests whose Host header is not loopback (127.0.0.1 or localhost)."""
+        host_hdr = self.headers.get("Host", "").strip()
+        if not host_hdr:
+            return False
+        hostname = host_hdr.split(":")[0].lower()
+        return hostname in ("127.0.0.1", "localhost")
 
-    def _is_valid_origin(self) -> bool:
-        origin = (self.headers.get("Origin") or "").strip()
-        if origin:
-            valid = {
-                f"http://127.0.0.1:{self.server_port}",
-                f"http://localhost:{self.server_port}",
-            }
-            return origin in valid
-        referer = (self.headers.get("Referer") or "").strip()
-        if referer:
-            return (
-                referer.startswith(f"http://127.0.0.1:{self.server_port}")
-                or referer.startswith(f"http://localhost:{self.server_port}")
-            )
-        # If neither is sent (e.g. direct programmatic call), rely on token authentication
-        return True
+    def _validate_origin(self) -> bool:
+        """Refuses cross-origin requests whose Origin header is not the dashboard's own."""
+        origin = self.headers.get("Origin", "").strip()
+        if not origin:
+            return True
+        parsed = urllib.parse.urlparse(origin)
+        hostname = (parsed.hostname or "").lower()
+        return hostname in ("127.0.0.1", "localhost")
 
-    def _extract_token(self, post_params: Optional[Dict[str, List[str]]] = None) -> Optional[str]:
-        auth_hdr = (self.headers.get("Authorization") or "").strip()
+    def _extract_token(self, parsed_params: Optional[Dict[str, List[str]]] = None) -> str:
+        # 1. Bearer / custom header
+        auth_hdr = self.headers.get("Authorization", "").strip()
         if auth_hdr.lower().startswith("bearer "):
             return auth_hdr[7:].strip()
-        x_tok = (self.headers.get("X-Duet-Token") or "").strip()
-        if x_tok:
-            return x_tok
-        if post_params and "token" in post_params:
-            return (post_params["token"][0] or "").strip()
-        query = urllib.parse.urlparse(self.path).query
-        if query:
-            q_dict = urllib.parse.parse_qs(query)
-            if "token" in q_dict:
-                return (q_dict["token"][0] or "").strip()
-        cookie_header = self.headers.get("Cookie") or ""
-        for item in cookie_header.split(";"):
-            k, _, v = item.strip().partition("=")
-            if k.strip() == "duet_token":
-                return v.strip()
-        return None
+        custom_hdr = self.headers.get("X-Duet-Token", "").strip()
+        if custom_hdr:
+            return custom_hdr
 
-    def _is_authenticated(self, post_params: Optional[Dict[str, List[str]]] = None) -> bool:
-        supplied = self._extract_token(post_params)
-        if not supplied:
-            return False
-        return secrets.compare_digest(supplied, self.auth_token)
+        # 2. Query or body parameter
+        if parsed_params and "token" in parsed_params:
+            val = parsed_params.get("token", [""])[0].strip()
+            if val:
+                return val
 
-    def _send_forbidden(self, reason: str) -> None:
-        self.send_response(403)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Connection", "close")
+        # 3. Cookie header
+        cookie_hdr = self.headers.get("Cookie", "")
+        if "duet_token=" in cookie_hdr:
+            for item in cookie_hdr.split(";"):
+                item = item.strip()
+                if item.startswith("duet_token="):
+                    return item.split("=", 1)[1].strip()
+        return ""
+
+    def _is_authenticated(self, parsed_params: Optional[Dict[str, List[str]]] = None) -> bool:
+        token = self._extract_token(parsed_params)
+        return bool(token and self.store.token and secrets.compare_digest(token, self.store.token))
+
+    def _send_unauthorized(self) -> None:
+        msg = (
+            "<!DOCTYPE html><html><body style='font-family:sans-serif;background:#0b0f17;color:#f87171;padding:40px;'>"
+            "<h2>401 Unauthorized — Security Token Required</h2>"
+            "<p style='color:#94a3b8;'>Access denied. Requests to the Duet dashboard and worker require the secret launch token.</p>"
+            "<p style='color:#cbd5e1;'>Open the dashboard using the URL printed on launch: <code>http://127.0.0.1:"
+            f"{self.server_port}/?token=&lt;token&gt;</code></p>"
+            "</body></html>"
+        )
+        raw = msg.encode("utf-8")
+        self.send_response(401)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
-        self.wfile.write(json.dumps({"ok": False, "error": f"Forbidden: {reason}"}).encode("utf-8"))
+        self.wfile.write(raw)
+
+    def _send_forbidden(self, reason: str = "Forbidden") -> None:
+        raw = f"403 Forbidden: {reason}\n".encode("utf-8")
+        self.send_response(403)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def _redirect(self, loc: str = "/") -> None:
-        query_token = f"?token={urllib.parse.quote(self.auth_token)}"
-        target = loc if ("?" in loc or "#" in loc) else f"{loc}{query_token}"
+        target = f"{loc}?token={self.store.token}" if "?" not in loc else f"{loc}&token={self.store.token}"
         self.send_response(303)
         self.send_header("Location", target)
-        self.send_header("Set-Cookie", f"duet_token={self.auth_token}; Path=/; HttpOnly; SameSite=Strict")
         self.end_headers()
 
     def do_GET(self) -> None:
-        if not self._is_valid_host():
-            self._send_forbidden("Host header mismatch.")
+        if not self._validate_host():
+            self._send_forbidden("Host header must be 127.0.0.1 or localhost")
             return
 
-        if self.path.startswith("/api/status"):
-            if not self._is_authenticated():
-                self._send_forbidden("Authentication token required for /api/status.")
-                return
+        parsed_url = urllib.parse.urlsplit(self.path)
+        params = urllib.parse.parse_qs(parsed_url.query)
+
+        if not self._is_authenticated(params):
+            self._send_unauthorized()
+            return
+
+        # API status query
+        if parsed_url.path.startswith("/api/status"):
             tasks = self.store.list_tasks(limit=30)
             chats = self.store.list_chats(limit=200)
             raw = json.dumps({"status": "ok", "tasks": tasks, "chats": chats}, ensure_ascii=False).encode("utf-8")
@@ -563,32 +591,28 @@ class DuetDashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
 
-        # Dashboard web UI
-        if not self._is_authenticated():
-            self._send_forbidden("Valid launch token required to view dashboard. Pass ?token=<launch_token>.")
-            return
-
+        # Render HTML dashboard
         tasks = self.store.list_tasks(limit=30)
         cards: List[str] = []
-        token_val = html.escape(self.auth_token)
         for t in tasks:
             tid = int(t["id"])
             st = str(t["status"])
+            pill_cls = f"st-{st}"
             approval_html = ""
             if st == "awaiting_approval":
                 approval_html = f"""
-                <div style="margin-top:10px; padding:10px; border:1px solid #f59e0b; border-radius:8px;">
-                  <strong>Human Approval Required:</strong> {html.escape(str(t.get('approval_action') or 'Task queued as awaiting approval.'))}
+                <div style="margin-top:10px; padding:10px; border:1px solid #f59e0b; border-radius:8px; background:rgba(245,158,11,0.08);">
+                  <strong style="color:#f59e0b;">⚠️ Operator Approval Required:</strong> {html.escape(str(t.get('approval_action') or ''))}
                   <div style="margin-top:8px; display:flex; gap:8px;">
                     <form method="POST" action="/approve">
-                      <input type="hidden" name="token" value="{token_val}">
+                      <input type="hidden" name="token" value="{self.store.token}">
                       <input type="hidden" name="id" value="{tid}">
-                      <button class="btn-approve">Approve Task</button>
+                      <button type="submit" class="btn-approve">Approve Task</button>
                     </form>
                     <form method="POST" action="/reject">
-                      <input type="hidden" name="token" value="{token_val}">
+                      <input type="hidden" name="token" value="{self.store.token}">
                       <input type="hidden" name="id" value="{tid}">
-                      <button class="btn-reject">Reject</button>
+                      <button type="submit" class="btn-reject">Reject</button>
                     </form>
                   </div>
                 </div>
@@ -603,7 +627,7 @@ class DuetDashboardHandler(BaseHTTPRequestHandler):
                 <div class="task-card">
                   <div style="display:flex; justify-content:space-between; align-items:center;">
                     <strong>#{tid} [{html.escape(str(t['category']))}] — {html.escape(str(t['title']))}</strong>
-                    <span class="status-pill">{html.escape(st)}</span>
+                    <span class="status-pill {pill_cls}">{html.escape(st)}</span>
                   </div>
                   <div class="meta">Created: {html.escape(str(t['created_at']))} • Model: {html.escape(str(t.get('model_used') or '-'))}</div>
                   {approval_html}
@@ -612,21 +636,20 @@ class DuetDashboardHandler(BaseHTTPRequestHandler):
                 """
             )
         body_html = "\n".join(cards) if cards else "<div class='task-card'>No tasks in queue yet.</div>"
-        page = _DASHBOARD_TEMPLATE.replace("__AUTH_TOKEN__", token_val).replace("__TASKS_HTML__", body_html).encode("utf-8")
+        page = _DASHBOARD_TEMPLATE.replace("__TOKEN__", self.store.token).replace("__TASKS_HTML__", body_html).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Set-Cookie", f"duet_token={self.store.token}; SameSite=Strict; HttpOnly; Path=/")
         self.send_header("Content-Length", str(len(page)))
-        self.send_header("Set-Cookie", f"duet_token={self.auth_token}; Path=/; HttpOnly; SameSite=Strict")
         self.end_headers()
         self.wfile.write(page)
 
     def do_POST(self) -> None:
-        if not self._is_valid_host():
-            self._send_forbidden("Host header mismatch.")
+        if not self._validate_host():
+            self._send_forbidden("Host header must be 127.0.0.1 or localhost")
             return
-
-        if not self._is_valid_origin():
-            self._send_forbidden("Cross-origin request rejected.")
+        if not self._validate_origin():
+            self._send_forbidden("Cross-origin POST rejected")
             return
 
         length = int(self.headers.get("Content-Length", "0"))
@@ -634,22 +657,24 @@ class DuetDashboardHandler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(raw)
 
         if not self._is_authenticated(params):
-            self._send_forbidden("Invalid or missing authorization token.")
+            self._send_unauthorized()
             return
 
-        if self.path == "/add":
+        parsed_path = urllib.parse.urlsplit(self.path).path
+
+        if parsed_path == "/add":
             title = (params.get("title", [""])[0]).strip()
             category = (params.get("category", ["general"])[0]).strip()
             if title:
-                # Explicit human action from dashboard creates an approved, runnable task
-                self.store.add_task(title=title, category=category, status="approved")
-        elif self.path == "/approve":
+                # Operator submission via dashboard starts as pending (runnable)
+                self.store.add_task(title=title, category=category, status="pending", log_note="Enqueued via authenticated Web Dashboard.")
+        elif parsed_path == "/approve":
             tid = int(params.get("id", ["0"])[0])
             self.store.set_status(tid, "approved", "Approved by operator via Web Dashboard.")
-        elif self.path == "/reject":
+        elif parsed_path == "/reject":
             tid = int(params.get("id", ["0"])[0])
             self.store.set_status(tid, "rejected", "Rejected by operator via Web Dashboard.")
-        elif self.path == "/chat":
+        elif parsed_path == "/chat":
             agent_id = (params.get("agent_id", ["duffy"])[0]).strip()
             msg = (params.get("message", [""])[0]).strip()
             if msg:
@@ -677,7 +702,7 @@ def _handle_public_agent_chat(store: DuetQueueStore, agent_id: str, user_msg: st
             f"User message: {user_msg}\n\n"
             f"Respond concisely and helpfully."
         )
-        reply, _ = run_agy_with_fallback(prompt=prompt)
+        reply, _ = run_agy_with_fallback(prompt=prompt, confined=True)
         store.add_chat(agent_id, "agent", reply.strip())
     except Exception as exc:
         store.add_chat(agent_id, "agent", f"Error generating response: {exc}")
@@ -685,17 +710,31 @@ def _handle_public_agent_chat(store: DuetQueueStore, agent_id: str, user_msg: st
 
 def process_next_task(store: DuetQueueStore, agy_bin: Optional[str] = None) -> bool:
     """
-    Process the next human-approved task in the queue.
-    Only tasks with status='approved' are executed by the worker.
+    Processes the next runnable task from the Duet queue.
+    Strictly respects Human-in-the-Loop gates:
+    1. First prioritizes tasks explicitly 'approved' by the human operator.
+    2. Next processes directly submitted 'pending' operator tasks.
+    3. Never runs tasks in 'awaiting_approval' status until approved.
     """
     conn = store._connect()
     try:
+        # 1. Prioritize approved tasks (tasks approved by operator)
         row = conn.execute(
             "SELECT * FROM duet_tasks WHERE status = 'approved' ORDER BY id ASC LIMIT 1"
         ).fetchone()
+
+        # 2. If no approved tasks, take directly submitted pending tasks
+        if not row:
+            row = conn.execute(
+                "SELECT * FROM duet_tasks WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+            ).fetchone()
+
         if not row:
             return False
+
         tid = int(row["id"])
+        is_resumed_approval = bool(row["status"] == "approved" and row["approval_action"])
+
         conn.execute(
             "UPDATE duet_tasks SET status = 'running', updated_at = ? WHERE id = ?",
             (_now_str(), tid),
@@ -706,24 +745,36 @@ def process_next_task(store: DuetQueueStore, agy_bin: Optional[str] = None) -> b
 
     task_ws = store.workspaces_dir / f"task_{tid}"
     task_ws.mkdir(parents=True, exist_ok=True)
-    store.add_log(tid, f"Starting approved task #{tid}: {row['title']}")
 
-    worker_prompt = (
-        f"You are an autonomous Duet background worker.\n"
-        f"Task #{tid} ({row['category']}): {row['title']}\n"
-        f"Working directory: {task_ws}\n\n"
-        f"Complete all research, analysis, drafting, and local file preparation autonomously. "
-        f"If the task requires an external or sensitive side-effect (sending external messages, "
-        f"modifying production records, or destructive actions), do NOT execute that final step; "
-        f"instead end your response with:\n"
-        f"[APPROVAL_REQUIRED: <concise description of the pending action>]"
-    )
+    if is_resumed_approval:
+        store.add_log(tid, f"Resuming approved task #{tid}: action '{row['approval_action']}' approved by operator.")
+        worker_prompt = (
+            f"You are an autonomous Duet background worker.\n"
+            f"Task #{tid} ({row['category']}): {row['title']}\n"
+            f"Working directory: {task_ws}\n\n"
+            f"The human operator has explicitly APPROVED the following pending action:\n"
+            f"{row['approval_action']}\n\n"
+            f"Complete the remaining work and summarize the final outcome."
+        )
+    else:
+        store.add_log(tid, f"Starting autonomous task #{tid}: {row['title']}")
+        worker_prompt = (
+            f"You are an autonomous Duet background worker.\n"
+            f"Task #{tid} ({row['category']}): {row['title']}\n"
+            f"Working directory: {task_ws}\n\n"
+            f"Complete all research, analysis, drafting, and local file preparation autonomously. "
+            f"If the task requires an external, financial, or sensitive action (sending external communications, "
+            f"modifying remote production databases, or destructive actions), do NOT perform it blindly; "
+            f"instead end your response with:\n"
+            f"[APPROVAL_REQUIRED: <concise description of the pending action>]"
+        )
 
     try:
         output, used_model = run_agy_with_fallback(
             prompt=worker_prompt,
             agy_bin=agy_bin,
             working_dir=task_ws,
+            confined=True,
         )
         match = re.search(r"\[APPROVAL_REQUIRED:\s*(.+?)\]", output, flags=re.DOTALL)
         conn2 = store._connect()
@@ -743,6 +794,7 @@ def process_next_task(store: DuetQueueStore, agy_bin: Optional[str] = None) -> b
                     """,
                     (used_model, clean_out, action_desc, _now_str(), tid),
                 )
+                store.add_log(tid, f"Paused at Human-in-the-Loop gate: awaiting approval for '{action_desc}'.")
             else:
                 conn2.execute(
                     """
@@ -756,10 +808,10 @@ def process_next_task(store: DuetQueueStore, agy_bin: Optional[str] = None) -> b
                     """,
                     (used_model, output, _now_str(), _now_str(), tid),
                 )
+                store.add_log(tid, f"Task completed successfully with model {used_model}.")
             conn2.commit()
         finally:
             conn2.close()
-        store.add_log(tid, f"Completed pass with model {used_model}.")
     except Exception as exc:
         store.add_log(tid, f"Task execution failed: {exc}", level="ERROR")
         store.set_status(tid, "failed", f"Error: {exc}")
@@ -768,7 +820,7 @@ def process_next_task(store: DuetQueueStore, agy_bin: Optional[str] = None) -> b
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Hermes Antigravity Duet — Autonomous Task Worker & Dashboard"
+        description="Hermes Antigravity Duet — Autonomous Background Worker & Dashboard"
     )
     sub = parser.add_subparsers(dest="cmd")
 
@@ -778,22 +830,23 @@ def main() -> None:
     p_worker.add_argument("--agy-bin", default=None)
 
     args = parser.parse_args()
-    cmd = args.cmd or "worker"
-    if cmd == "worker":
-        store = DuetQueueStore()
-        token = get_or_generate_launch_token(store.base_dir)
-        DuetDashboardHandler.store = store
-        DuetDashboardHandler.auth_token = token
-        DuetDashboardHandler.server_port = args.port
-        DuetDashboardHandler.server_host = args.host
+    if args.cmd == "worker" or args.cmd is None:
+        host = getattr(args, "host", "127.0.0.1")
+        port = getattr(args, "port", 8899)
+        agy_bin = getattr(args, "agy_bin", None)
 
-        srv = ThreadingHTTPServer((args.host, args.port), DuetDashboardHandler)
+        store = DuetQueueStore()
+        DuetDashboardHandler.store = store
+        DuetDashboardHandler.server_port = port
+
+        srv = ThreadingHTTPServer((host, port), DuetDashboardHandler)
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
-        print(f"Duet Worker & Dashboard listening on http://{args.host}:{args.port}/?token={token}", flush=True)
-        print(f"Auth token (stored 0600 in {store.token_file}): {token}", flush=True)
+        print(f"Duet Worker & Dashboard listening on http://{host}:{port}/?token={store.token}", flush=True)
+        print(f"Security token stored with 0600 permissions in {store.base_dir / '.dashboard_token'}", flush=True)
+
         while True:
-            did = process_next_task(store, agy_bin=args.agy_bin)
+            did = process_next_task(store, agy_bin=agy_bin)
             time.sleep(3 if did else 10)
     else:
         parser.print_help()

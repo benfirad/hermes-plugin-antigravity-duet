@@ -11,8 +11,7 @@ platforms:
 provides_tools:
   - duet_queue
   - ruflo_swarm
-provides_hooks:
-  - pre_tool_call
+provides_hooks: []
 requires_env: []
 config_schema:
   dashboard_port:

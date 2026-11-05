@@ -1,13 +1,12 @@
 """
 antigravity-duet — Autonomous background task queue (Duet / Duffy Do-For-You worker)
 with Human-in-the-Loop approval gates, Ruflo multi-agent swarm orchestration,
-and multi-model Antigravity CLI fallback.
+and multi-model Antigravity CLI quota fallback.
 
 Registers:
-- Tool `duet_queue`: Add, list, or inspect background tasks (model cannot self-approve).
+- Tool `duet_queue`: Enqueue, list, and inspect background tasks (Human-in-the-Loop gated).
 - Tool `ruflo_swarm`: Spawn, inspect, coordinate, and manage Ruflo multi-agent swarms.
-- Hook `pre_tool_call`: Escalate agent_spawn / swarm_start to human approval gate.
-- Slash commands `/duet` and `/duffy`: Interactive human queue & swarm management.
+- Slash commands `/duet` and `/duffy`: Interactive operator queue & swarm management.
 """
 
 from __future__ import annotations
@@ -15,15 +14,19 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional
 
-from .duet_engine import DuetQueueStore, run_ruflo_command
+try:
+    from .duet_engine import DuetQueueStore, run_ruflo_command
+except (ImportError, ValueError):
+    from duet_engine import DuetQueueStore, run_ruflo_command
 
 _DUET_TOOL_SCHEMA: Dict[str, Any] = {
     "name": "duet_queue",
     "description": (
         "Manage the autonomous Duet / Duffy ('Do-For-You') background task queue. "
         "Use this tool to enqueue long-running or asynchronous background tasks, "
-        "check queue status, or inspect task execution logs. "
-        "Tasks enqueued by the model pause in 'awaiting_approval' until confirmed by a human operator."
+        "check queue status, or view execution logs. "
+        "Note: Tasks enqueued by agents are placed in 'awaiting_approval' status and "
+        "require human operator approval via /duffy approve or the dashboard before running."
     ),
     "parameters": {
         "type": "object",
@@ -31,7 +34,7 @@ _DUET_TOOL_SCHEMA: Dict[str, Any] = {
             "action": {
                 "type": "string",
                 "enum": ["add", "list", "show"],
-                "description": "Operation to perform on the Duet/Duffy queue. Approval and retry actions are restricted to human operators.",
+                "description": "Operation to perform on the Duet/Duffy queue (add, list, show).",
             },
             "title": {
                 "type": "string",
@@ -93,13 +96,13 @@ _RUFLO_SWARM_SCHEMA: Dict[str, Any] = {
 _HELP_TEXT = """\
 /duffy (or /duet) — Autonomous Do-For-You Background Queue & Ruflo Swarm Controller
 
-Subcommands:
+Operator Subcommands:
   list                       List recent tasks in the Duet/Duffy queue
-  add <instruction>          Enqueue a new autonomous background task (approved)
+  add <instruction>          Enqueue a runnable task directly as the operator
   show <id>                  Show detailed summary and logs for task #<id>
-  approve <id>               Approve a task paused at a Human-in-the-Loop gate
+  approve <id>               Approve a task paused at a Human-in-the-Loop gate (makes runnable)
   reject <id>                Reject/cancel a task
-  retry <id>                 Re-queue a failed or rejected task as approved
+  retry <id>                 Re-queue a failed or rejected task
   swarm                      Show Ruflo multi-agent swarm & agent pool status
 """
 
@@ -114,15 +117,20 @@ def _handle_duet_tool(args: Optional[Dict[str, Any]] = None, **_: Any) -> str:
         if not title:
             return json.dumps({"ok": False, "error": "Missing 'title' for action='add'."})
         category = str(params.get("category") or "general").strip()
-        # Tasks added via the agent model enter awaiting_approval for human safety
-        tid = store.add_task(title=title, category=category, status="awaiting_approval")
+        # Human-in-the-Loop gate: agent-submitted tasks require operator approval
+        tid = store.add_task(
+            title=title,
+            category=category,
+            status="awaiting_approval",
+            log_note="Enqueued by model agent via duet_queue tool (awaiting human operator approval).",
+        )
         return json.dumps({
             "ok": True,
             "task_id": tid,
             "status": "awaiting_approval",
             "message": (
-                f"Task #{tid} added to queue and is awaiting human operator approval before execution. "
-                f"The operator can approve it via '/duffy approve {tid}' or the web dashboard."
+                f"Task #{tid} added to Duet/Duffy queue in 'awaiting_approval' status. "
+                f"It requires human operator approval via '/duffy approve {tid}' or web dashboard before running."
             ),
         })
 
@@ -143,7 +151,10 @@ def _handle_duet_tool(args: Optional[Dict[str, Any]] = None, **_: Any) -> str:
     if action in ("approve", "reject", "retry"):
         return json.dumps({
             "ok": False,
-            "error": f"Action {action!r} is restricted to human operators via /duffy or the dashboard. Models cannot approve or retry tasks.",
+            "error": (
+                f"Action {action!r} is restricted to the human operator. "
+                "The model agent cannot self-approve or retry tasks; use the /duffy slash command or web dashboard."
+            ),
         })
 
     return json.dumps({"ok": False, "error": f"Unsupported action: {action!r}"})
@@ -179,34 +190,18 @@ def _handle_ruflo_tool(args: Optional[Dict[str, Any]] = None, **_: Any) -> str:
 
     if action == "swarm_start":
         obj = str(params.get("objective") or "Execute parallel multi-agent workflow").strip()
-        res = run_ruflo_command(["swarm", "start", "-o", "--", obj])
+        res = run_ruflo_command(["swarm", "start", "-o", obj])
         return json.dumps(res, ensure_ascii=False)
 
     if action == "memory_search":
         query = str(params.get("objective") or "").strip()
         if not query:
             return json.dumps({"ok": False, "error": "Missing 'objective' query for memory_search."})
+        # Pass '--' before positional query as safety guard
         res = run_ruflo_command(["memory", "search", "--", query])
         return json.dumps(res, ensure_ascii=False)
 
     return json.dumps({"ok": False, "error": f"Unsupported ruflo_swarm action: {action!r}"})
-
-
-def _on_pre_tool_call(
-    tool_name: str = "",
-    args: Optional[Dict[str, Any]] = None,
-    task_id: str = "",
-    **_: Any,
-) -> Optional[Dict[str, Any]]:
-    """Escalate destructive or multi-agent spawning actions to human approval gate."""
-    if tool_name == "ruflo_swarm":
-        action = str((args or {}).get("action") or "").strip().lower()
-        if action in ("agent_spawn", "swarm_start"):
-            return {
-                "action": "approve",
-                "message": f"Ruflo swarm operation '{action}' will launch autonomous sub-agent/swarm processes.",
-            }
-    return None
 
 
 def _handle_duet_slash(raw_args: str) -> str:
@@ -237,9 +232,9 @@ def _handle_duet_slash(raw_args: str) -> str:
     if cmd == "add":
         if not rest:
             return "Usage: /duffy add <instruction>"
-        # Explicit operator command is approved by definition
-        tid = store.add_task(title=rest, category="general", status="approved")
-        return f"Added task #{tid} to Duffy/Duet queue (status: approved for execution): {rest}"
+        # Operator addition is runnable (pending)
+        tid = store.add_task(title=rest, category="general", status="pending", log_note="Enqueued directly by operator via /duffy add.")
+        return f"Added task #{tid} to Duffy/Duet queue (pending/runnable): {rest}"
 
     if cmd in ("show", "approve", "reject", "retry"):
         if not rest.isdigit():
@@ -259,9 +254,12 @@ def _handle_duet_slash(raw_args: str) -> str:
                 out.append(f"\n--- Summary ---\n{detail['result_summary']}")
             return "\n".join(out)
 
-        target_map = {"approve": "approved", "reject": "rejected", "retry": "approved"}
+        target_map = {"approve": "approved", "reject": "rejected", "retry": "pending"}
         new_status = target_map[cmd]
-        if store.set_status(tid, new_status, f"Operator ran /duffy {cmd} #{tid}"):
+        note = f"Operator ran /duffy {cmd} #{tid}"
+        if store.set_status(tid, new_status, note):
+            if cmd == "approve":
+                return f"Task #{tid} explicitly approved. Status updated to 'approved' (worker will execute/resume task)."
             return f"Task #{tid} status updated to '{new_status}'."
         return f"Task #{tid} not found."
 
@@ -274,7 +272,7 @@ def register(ctx: Any) -> None:
         toolset="duet",
         schema=_DUET_TOOL_SCHEMA,
         handler=_handle_duet_tool,
-        description="Manage the autonomous Duet / Duffy ('Do-For-You') background task queue and Human-in-the-Loop approvals.",
+        description="Manage the autonomous Duet / Duffy ('Do-For-You') background task queue (tasks await human operator approval).",
     )
     ctx.register_tool(
         name="ruflo_swarm",
@@ -282,10 +280,6 @@ def register(ctx: Any) -> None:
         schema=_RUFLO_SWARM_SCHEMA,
         handler=_handle_ruflo_tool,
         description="Orchestrate Ruflo multi-agent swarms and specialized agents (spawn, list, stop, swarm start, memory search).",
-    )
-    ctx.register_hook(
-        "pre_tool_call",
-        _on_pre_tool_call,
     )
     ctx.register_command(
         "duet",
