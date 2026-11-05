@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Sanitized, generic Duet Queue Store, Multi-Model Antigravity CLI Bridge,
-and Human-in-the-Loop Web Dashboard for Hermes Agent.
+Sanitized, generic Duet Queue Store, Multi-Model Antigravity CLI Fallback,
+and Secure Human-in-the-Loop Web Dashboard for Hermes Agent.
 
 Contains zero personal data, hardcoded paths, or third-party credentials.
-All state is stored inside `$HERMES_HOME/duet/` (default `~/.hermes/duet/`).
+All state is stored inside `$HERMES_HOME/plugin-data/antigravity-duet/`.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
 import sqlite3
 import subprocess
@@ -24,7 +25,6 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 import urllib.parse
-import uuid
 from datetime import datetime
 
 DEFAULT_FALLBACK_MODELS: Tuple[str, ...] = (
@@ -61,10 +61,21 @@ def _now_str() -> str:
 
 
 def resolve_hermes_home() -> Path:
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home()).resolve()
+    except Exception:
+        pass
     env_home = os.environ.get("HERMES_HOME")
     if env_home:
         return Path(env_home).expanduser().resolve()
     return (Path.home() / ".hermes").resolve()
+
+
+def get_plugin_data_dir() -> Path:
+    base = resolve_hermes_home() / "plugin-data" / "antigravity-duet"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 
 def resolve_agy_bin(custom_bin: Optional[str] = None) -> str:
@@ -97,14 +108,15 @@ def run_ruflo_command(
     working_dir: Optional[Path] = None,
     timeout_sec: int = 60,
 ) -> Dict[str, Any]:
-    """Execute a sanitized Ruflo multi-agent / swarm command (status, list, spawn, stop, init)."""
+    """Execute a sanitized Ruflo command inside the plugin data directory."""
     binary = resolve_ruflo_bin(ruflo_bin)
-    cwd = str(working_dir or resolve_hermes_home())
+    ruflo_cwd = working_dir or (get_plugin_data_dir() / "ruflo")
+    ruflo_cwd.mkdir(parents=True, exist_ok=True)
     cmd = [binary] + [str(a) for a in sub_args]
     try:
         res = subprocess.run(
             cmd,
-            cwd=cwd,
+            cwd=str(ruflo_cwd),
             capture_output=True,
             text=True,
             timeout=timeout_sec,
@@ -121,7 +133,6 @@ def run_ruflo_command(
         return {"ok": False, "exit_code": -1, "error": str(exc)}
 
 
-
 def resolve_model_id(name: Optional[str]) -> str:
     if not name:
         return DEFAULT_FALLBACK_MODELS[0]
@@ -135,9 +146,10 @@ class DuetQueueStore:
     """SQLite-backed persistent queue for autonomous Duet tasks and Human-in-the-Loop approvals."""
 
     def __init__(self, base_dir: Optional[Path] = None) -> None:
-        self.base_dir = base_dir or (resolve_hermes_home() / "duet")
+        self.base_dir = base_dir or get_plugin_data_dir()
         self.db_path = self.base_dir / "duet.db"
         self.workspaces_dir = self.base_dir / "workspaces"
+        self.token_file = self.base_dir / "dashboard_token.txt"
         self._ensure_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -157,7 +169,7 @@ class DuetQueueStore:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
                     category TEXT DEFAULT 'general',
-                    status TEXT DEFAULT 'pending',
+                    status TEXT DEFAULT 'awaiting_approval',
                     model_used TEXT,
                     result_summary TEXT,
                     approval_action TEXT,
@@ -227,22 +239,27 @@ class DuetQueueStore:
         finally:
             conn.close()
 
-    def add_task(self, title: str, category: str = "general") -> int:
+    def add_task(
+        self,
+        title: str,
+        category: str = "general",
+        status: str = "awaiting_approval",
+    ) -> int:
         ts = _now_str()
         conn = self._connect()
         try:
             cur = conn.execute(
                 """
                 INSERT INTO duet_tasks (title, category, status, created_at, updated_at)
-                VALUES (?, ?, 'pending', ?, ?)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (title, category, ts, ts),
+                (title, category, status, ts, ts),
             )
             tid = int(cur.lastrowid or 0)
             conn.commit()
         finally:
             conn.close()
-        self.add_log(tid, f"Task added to queue (category={category}).")
+        self.add_log(tid, f"Task added to queue (category={category}, status={status}).")
         return tid
 
     def list_tasks(self, limit: int = 20) -> List[Dict[str, Any]]:
@@ -298,13 +315,13 @@ def run_agy_with_fallback(
     timeout_sec: int = 180,
 ) -> Tuple[str, str]:
     """
-    Invoke the official Antigravity CLI (`agy`) in print mode (`-p`),
+    Invoke the official Antigravity CLI (`agy`) in print mode (`-p`) with tools confined (`--no-tools`),
     automatically falling back across the subscription model pool on quota exhaustion.
     """
     binary = resolve_agy_bin(agy_bin)
     primary = resolve_model_id(preferred_model)
     candidates = [primary] + [m for m in DEFAULT_FALLBACK_MODELS if m != primary]
-    cwd = str(working_dir or resolve_hermes_home())
+    cwd = str(working_dir or get_plugin_data_dir())
 
     last_err = ""
     for candidate in candidates:
@@ -312,6 +329,7 @@ def run_agy_with_fallback(
             binary,
             "--model",
             candidate,
+            "--no-tools",
             "--disable-slash-commands",
             "--print-timeout",
             f"{timeout_sec}s",
@@ -342,145 +360,26 @@ def run_agy_with_fallback(
     raise RuntimeError(last_err or "All fallback models in Antigravity CLI pool failed.")
 
 
-# =============================================================================
-# OpenAI-Compatible Multi-Model Bridge HTTP Handler
-# =============================================================================
-
-
-def _build_prompt_from_openai_messages(messages: List[Dict[str, Any]]) -> str:
-    parts: List[str] = []
-    for msg in messages:
-        role = str(msg.get("role") or "user").upper()
-        content = msg.get("content") or ""
-        if isinstance(content, list):
-            text_items = [
-                str(item.get("text") or "")
-                for item in content
-                if isinstance(item, dict) and item.get("type") == "text"
-            ]
-            content = "\n".join(text_items)
-        text = str(content).strip()
-        if text:
-            parts.append(f"[{role}]:\n{text}")
-    return "\n\n".join(parts)
-
-
-class AntigravityBridgeHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-    agy_bin: Optional[str] = None
-
-    def log_message(self, fmt: str, *args: Any) -> None:
-        pass
-
-    def _send_json(self, status: int, payload: Dict[str, Any]) -> None:
-        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def do_GET(self) -> None:
-        if self.path.startswith("/v1/models") or self.path.startswith("/models"):
-            models = [
-                {
-                    "id": m,
-                    "object": "model",
-                    "created": 1700000000,
-                    "owned_by": "antigravity",
-                    "context_length": 1048576,
-                }
-                for m in DEFAULT_FALLBACK_MODELS
-            ]
-            self._send_json(200, {"object": "list", "data": models})
-        elif self.path.startswith("/health"):
-            self._send_json(
-                200,
-                {
-                    "status": "ok",
-                    "agy_bin": resolve_agy_bin(self.agy_bin),
-                    "fallback_models": list(DEFAULT_FALLBACK_MODELS),
-                },
-            )
-        else:
-            self._send_json(200, {"status": "ok"})
-
-    def do_POST(self) -> None:
-        if not (self.path.startswith("/v1/chat/completions") or self.path.startswith("/chat/completions")):
-            self._send_json(404, {"error": {"message": f"Unsupported path: {self.path}"}})
-            return
-
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
+def get_or_generate_launch_token(data_dir: Path) -> str:
+    """Generate a random auth token per launch, stored with permissions 0600 in plugin-data."""
+    data_dir.mkdir(parents=True, exist_ok=True)
+    token = secrets.token_urlsafe(32)
+    token_file = data_dir / "dashboard_token.txt"
+    try:
+        fd = os.open(str(token_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with open(fd, "w") as f:
+            f.write(token)
+    except Exception:
+        token_file.write_text(token)
         try:
-            req = json.loads(body)
-        except Exception as exc:
-            self._send_json(400, {"error": {"message": f"Invalid JSON: {exc}"}})
-            return
-
-        model_req = str(req.get("model") or DEFAULT_FALLBACK_MODELS[0])
-        messages = req.get("messages") or []
-        stream = bool(req.get("stream", False))
-        prompt = _build_prompt_from_openai_messages(messages)
-
-        try:
-            reply_text, used_model = run_agy_with_fallback(
-                prompt=prompt,
-                preferred_model=model_req,
-                agy_bin=self.agy_bin,
-            )
-        except Exception as exc:
-            self._send_json(500, {"error": {"message": str(exc), "type": "antigravity_cli_error"}})
-            return
-
-        comp_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
-        created = int(time.time())
-
-        if stream:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Connection", "close")
-            self.end_headers()
-            chunk1 = {
-                "id": comp_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": used_model,
-                "choices": [{"index": 0, "delta": {"role": "assistant", "content": reply_text}, "finish_reason": None}],
-            }
-            chunk2 = {
-                "id": comp_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": used_model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-            }
-            self.wfile.write(f"data: {json.dumps(chunk1, ensure_ascii=False)}\n\n".encode("utf-8"))
-            self.wfile.write(f"data: {json.dumps(chunk2, ensure_ascii=False)}\n\n".encode("utf-8"))
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        else:
-            self._send_json(
-                200,
-                {
-                    "id": comp_id,
-                    "object": "chat.completion",
-                    "created": created,
-                    "model": used_model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {"role": "assistant", "content": reply_text},
-                            "finish_reason": "stop",
-                        }
-                    ],
-                },
-            )
+            os.chmod(str(token_file), 0o600)
+        except Exception:
+            pass
+    return token
 
 
 # =============================================================================
-# Duet Worker & Web Dashboard
+# Duet Worker & Secure Web Dashboard
 # =============================================================================
 
 _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
@@ -544,12 +443,13 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   <header>
     <div>
       <h2 style="margin:0;">Hermes Antigravity Duet</h2>
-      <div class="meta">Autonomous Background Queue • Multi-Model Antigravity CLI Fallback • Human-in-the-Loop Safety</div>
+      <div class="meta">Autonomous Background Queue • Human-in-the-Loop Approval Gate • Ruflo Swarm Controller</div>
     </div>
-    <span class="badge">Multi-Model Subscription Pool</span>
+    <span class="badge">Authenticated Session</span>
   </header>
   <div class="new-box">
     <form class="new-form" method="POST" action="/add">
+      <input type="hidden" name="token" value="__AUTH_TOKEN__">
       <select name="category">
         <option value="general">General</option>
         <option value="research">Research</option>
@@ -557,7 +457,7 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
         <option value="ops">Ops</option>
       </select>
       <input type="text" name="title" placeholder="Describe an autonomous background task..." required>
-      <button type="submit" class="btn-primary">+ Enqueue Task</button>
+      <button type="submit" class="btn-primary">+ Enqueue Task (Approved)</button>
     </form>
   </div>
   __TASKS_HTML__
@@ -568,17 +468,91 @@ _DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 class DuetDashboardHandler(BaseHTTPRequestHandler):
     store: DuetQueueStore
+    auth_token: str
+    server_port: int = 8899
+    server_host: str = "127.0.0.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
         pass
 
+    def _is_valid_host(self) -> bool:
+        host = (self.headers.get("Host") or "").strip().lower()
+        valid = {
+            f"127.0.0.1:{self.server_port}",
+            f"localhost:{self.server_port}",
+            "127.0.0.1",
+            "localhost",
+        }
+        return host in valid
+
+    def _is_valid_origin(self) -> bool:
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin:
+            valid = {
+                f"http://127.0.0.1:{self.server_port}",
+                f"http://localhost:{self.server_port}",
+            }
+            return origin in valid
+        referer = (self.headers.get("Referer") or "").strip()
+        if referer:
+            return (
+                referer.startswith(f"http://127.0.0.1:{self.server_port}")
+                or referer.startswith(f"http://localhost:{self.server_port}")
+            )
+        # If neither is sent (e.g. direct programmatic call), rely on token authentication
+        return True
+
+    def _extract_token(self, post_params: Optional[Dict[str, List[str]]] = None) -> Optional[str]:
+        auth_hdr = (self.headers.get("Authorization") or "").strip()
+        if auth_hdr.lower().startswith("bearer "):
+            return auth_hdr[7:].strip()
+        x_tok = (self.headers.get("X-Duet-Token") or "").strip()
+        if x_tok:
+            return x_tok
+        if post_params and "token" in post_params:
+            return (post_params["token"][0] or "").strip()
+        query = urllib.parse.urlparse(self.path).query
+        if query:
+            q_dict = urllib.parse.parse_qs(query)
+            if "token" in q_dict:
+                return (q_dict["token"][0] or "").strip()
+        cookie_header = self.headers.get("Cookie") or ""
+        for item in cookie_header.split(";"):
+            k, _, v = item.strip().partition("=")
+            if k.strip() == "duet_token":
+                return v.strip()
+        return None
+
+    def _is_authenticated(self, post_params: Optional[Dict[str, List[str]]] = None) -> bool:
+        supplied = self._extract_token(post_params)
+        if not supplied:
+            return False
+        return secrets.compare_digest(supplied, self.auth_token)
+
+    def _send_forbidden(self, reason: str) -> None:
+        self.send_response(403)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(json.dumps({"ok": False, "error": f"Forbidden: {reason}"}).encode("utf-8"))
+
     def _redirect(self, loc: str = "/") -> None:
+        query_token = f"?token={urllib.parse.quote(self.auth_token)}"
+        target = loc if ("?" in loc or "#" in loc) else f"{loc}{query_token}"
         self.send_response(303)
-        self.send_header("Location", loc)
+        self.send_header("Location", target)
+        self.send_header("Set-Cookie", f"duet_token={self.auth_token}; Path=/; HttpOnly; SameSite=Strict")
         self.end_headers()
 
     def do_GET(self) -> None:
+        if not self._is_valid_host():
+            self._send_forbidden("Host header mismatch.")
+            return
+
         if self.path.startswith("/api/status"):
+            if not self._is_authenticated():
+                self._send_forbidden("Authentication token required for /api/status.")
+                return
             tasks = self.store.list_tasks(limit=30)
             chats = self.store.list_chats(limit=200)
             raw = json.dumps({"status": "ok", "tasks": tasks, "chats": chats}, ensure_ascii=False).encode("utf-8")
@@ -589,8 +563,14 @@ class DuetDashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
             return
 
+        # Dashboard web UI
+        if not self._is_authenticated():
+            self._send_forbidden("Valid launch token required to view dashboard. Pass ?token=<launch_token>.")
+            return
+
         tasks = self.store.list_tasks(limit=30)
         cards: List[str] = []
+        token_val = html.escape(self.auth_token)
         for t in tasks:
             tid = int(t["id"])
             st = str(t["status"])
@@ -598,10 +578,18 @@ class DuetDashboardHandler(BaseHTTPRequestHandler):
             if st == "awaiting_approval":
                 approval_html = f"""
                 <div style="margin-top:10px; padding:10px; border:1px solid #f59e0b; border-radius:8px;">
-                  <strong>Approval Required:</strong> {html.escape(str(t.get('approval_action') or ''))}
+                  <strong>Human Approval Required:</strong> {html.escape(str(t.get('approval_action') or 'Task queued as awaiting approval.'))}
                   <div style="margin-top:8px; display:flex; gap:8px;">
-                    <form method="POST" action="/approve"><input type="hidden" name="id" value="{tid}"><button class="btn-approve">Approve</button></form>
-                    <form method="POST" action="/reject"><input type="hidden" name="id" value="{tid}"><button class="btn-reject">Reject</button></form>
+                    <form method="POST" action="/approve">
+                      <input type="hidden" name="token" value="{token_val}">
+                      <input type="hidden" name="id" value="{tid}">
+                      <button class="btn-approve">Approve Task</button>
+                    </form>
+                    <form method="POST" action="/reject">
+                      <input type="hidden" name="token" value="{token_val}">
+                      <input type="hidden" name="id" value="{tid}">
+                      <button class="btn-reject">Reject</button>
+                    </form>
                   </div>
                 </div>
                 """
@@ -624,29 +612,43 @@ class DuetDashboardHandler(BaseHTTPRequestHandler):
                 """
             )
         body_html = "\n".join(cards) if cards else "<div class='task-card'>No tasks in queue yet.</div>"
-        page = _DASHBOARD_TEMPLATE.replace("__TASKS_HTML__", body_html).encode("utf-8")
+        page = _DASHBOARD_TEMPLATE.replace("__AUTH_TOKEN__", token_val).replace("__TASKS_HTML__", body_html).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(page)))
+        self.send_header("Set-Cookie", f"duet_token={self.auth_token}; Path=/; HttpOnly; SameSite=Strict")
         self.end_headers()
         self.wfile.write(page)
 
     def do_POST(self) -> None:
+        if not self._is_valid_host():
+            self._send_forbidden("Host header mismatch.")
+            return
+
+        if not self._is_valid_origin():
+            self._send_forbidden("Cross-origin request rejected.")
+            return
+
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length).decode("utf-8") if length > 0 else ""
         params = urllib.parse.parse_qs(raw)
+
+        if not self._is_authenticated(params):
+            self._send_forbidden("Invalid or missing authorization token.")
+            return
 
         if self.path == "/add":
             title = (params.get("title", [""])[0]).strip()
             category = (params.get("category", ["general"])[0]).strip()
             if title:
-                self.store.add_task(title=title, category=category)
+                # Explicit human action from dashboard creates an approved, runnable task
+                self.store.add_task(title=title, category=category, status="approved")
         elif self.path == "/approve":
             tid = int(params.get("id", ["0"])[0])
-            self.store.set_status(tid, "approved", "Approved via Web Dashboard.")
+            self.store.set_status(tid, "approved", "Approved by operator via Web Dashboard.")
         elif self.path == "/reject":
             tid = int(params.get("id", ["0"])[0])
-            self.store.set_status(tid, "rejected", "Rejected via Web Dashboard.")
+            self.store.set_status(tid, "rejected", "Rejected by operator via Web Dashboard.")
         elif self.path == "/chat":
             agent_id = (params.get("agent_id", ["duffy"])[0]).strip()
             msg = (params.get("message", [""])[0]).strip()
@@ -664,6 +666,7 @@ class DuetDashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(raw_json)
             return
+
         self._redirect("/")
 
 
@@ -681,10 +684,14 @@ def _handle_public_agent_chat(store: DuetQueueStore, agent_id: str, user_msg: st
 
 
 def process_next_task(store: DuetQueueStore, agy_bin: Optional[str] = None) -> bool:
+    """
+    Process the next human-approved task in the queue.
+    Only tasks with status='approved' are executed by the worker.
+    """
     conn = store._connect()
     try:
         row = conn.execute(
-            "SELECT * FROM duet_tasks WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+            "SELECT * FROM duet_tasks WHERE status = 'approved' ORDER BY id ASC LIMIT 1"
         ).fetchone()
         if not row:
             return False
@@ -699,7 +706,7 @@ def process_next_task(store: DuetQueueStore, agy_bin: Optional[str] = None) -> b
 
     task_ws = store.workspaces_dir / f"task_{tid}"
     task_ws.mkdir(parents=True, exist_ok=True)
-    store.add_log(tid, f"Starting autonomous task #{tid}: {row['title']}")
+    store.add_log(tid, f"Starting approved task #{tid}: {row['title']}")
 
     worker_prompt = (
         f"You are an autonomous Duet background worker.\n"
@@ -761,14 +768,9 @@ def process_next_task(store: DuetQueueStore, agy_bin: Optional[str] = None) -> b
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Hermes Antigravity Duet — Multi-Model Bridge & Autonomous Worker"
+        description="Hermes Antigravity Duet — Autonomous Task Worker & Dashboard"
     )
     sub = parser.add_subparsers(dest="cmd")
-
-    p_bridge = sub.add_parser("bridge", help="Run the local OpenAI-compatible multi-model agy bridge")
-    p_bridge.add_argument("--host", default="127.0.0.1")
-    p_bridge.add_argument("--port", type=int, default=8765)
-    p_bridge.add_argument("--agy-bin", default=None)
 
     p_worker = sub.add_parser("worker", help="Run the Duet background worker + Web Dashboard")
     p_worker.add_argument("--host", default="127.0.0.1")
@@ -776,21 +778,23 @@ def main() -> None:
     p_worker.add_argument("--agy-bin", default=None)
 
     args = parser.parse_args()
-    if args.cmd == "bridge":
-        AntigravityBridgeHandler.agy_bin = args.agy_bin
-        srv = ThreadingHTTPServer((args.host, args.port), AntigravityBridgeHandler)
-        print(f"Antigravity OpenAI Bridge listening on http://{args.host}:{args.port}/v1", flush=True)
-        srv.serve_forever()
-    elif args.cmd == "worker":
+    cmd = args.cmd or "worker"
+    if cmd == "worker":
         store = DuetQueueStore()
+        token = get_or_generate_launch_token(store.base_dir)
         DuetDashboardHandler.store = store
+        DuetDashboardHandler.auth_token = token
+        DuetDashboardHandler.server_port = args.port
+        DuetDashboardHandler.server_host = args.host
+
         srv = ThreadingHTTPServer((args.host, args.port), DuetDashboardHandler)
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
-        print(f"Duet Worker & Dashboard listening on http://{args.host}:{args.port}", flush=True)
+        print(f"Duet Worker & Dashboard listening on http://{args.host}:{args.port}/?token={token}", flush=True)
+        print(f"Auth token (stored 0600 in {store.token_file}): {token}", flush=True)
         while True:
             did = process_next_task(store, agy_bin=args.agy_bin)
-            time.sleep(3 if did else 12)
+            time.sleep(3 if did else 10)
     else:
         parser.print_help()
 

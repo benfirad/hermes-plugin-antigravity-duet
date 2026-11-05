@@ -1,5 +1,5 @@
 name: antigravity-duet
-version: "0.2.0"
+version: "0.2.1"
 description: "Autonomous background task queue (Duet / Duffy Do-For-You worker) with Human-in-the-Loop approval gates, Ruflo multi-agent swarm orchestration, and multi-model Antigravity CLI quota fallback for Hermes Agent."
 author: "benfirad"
 license: "MIT"
@@ -11,12 +11,10 @@ platforms:
 provides_tools:
   - duet_queue
   - ruflo_swarm
-provides_hooks: []
+provides_hooks:
+  - pre_tool_call
 requires_env: []
 config_schema:
-  bridge_port:
-    type: int
-    required: false
   dashboard_port:
     type: int
     required: false
@@ -26,4 +24,3 @@ config_schema:
   ruflo_bin:
     type: str
     required: false
-

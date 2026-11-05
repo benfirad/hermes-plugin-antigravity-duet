@@ -4,9 +4,10 @@ with Human-in-the-Loop approval gates, Ruflo multi-agent swarm orchestration,
 and multi-model Antigravity CLI fallback.
 
 Registers:
-- Tool `duet_queue`: Add, list, inspect, approve, or reject background tasks.
+- Tool `duet_queue`: Add, list, or inspect background tasks (model cannot self-approve).
 - Tool `ruflo_swarm`: Spawn, inspect, coordinate, and manage Ruflo multi-agent swarms.
-- Slash commands `/duet` and `/duffy`: Interactive queue & swarm management.
+- Hook `pre_tool_call`: Escalate agent_spawn / swarm_start to human approval gate.
+- Slash commands `/duet` and `/duffy`: Interactive human queue & swarm management.
 """
 
 from __future__ import annotations
@@ -21,15 +22,16 @@ _DUET_TOOL_SCHEMA: Dict[str, Any] = {
     "description": (
         "Manage the autonomous Duet / Duffy ('Do-For-You') background task queue. "
         "Use this tool to enqueue long-running or asynchronous background tasks, "
-        "check queue status, view task logs, or record human-in-the-loop approvals/rejections."
+        "check queue status, or inspect task execution logs. "
+        "Tasks enqueued by the model pause in 'awaiting_approval' until confirmed by a human operator."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "list", "show", "approve", "reject", "retry"],
-                "description": "Operation to perform on the Duet/Duffy queue.",
+                "enum": ["add", "list", "show"],
+                "description": "Operation to perform on the Duet/Duffy queue. Approval and retry actions are restricted to human operators.",
             },
             "title": {
                 "type": "string",
@@ -41,7 +43,7 @@ _DUET_TOOL_SCHEMA: Dict[str, Any] = {
             },
             "task_id": {
                 "type": "integer",
-                "description": "Task ID (required for show, approve, reject, retry).",
+                "description": "Task ID (required for show).",
             },
         },
         "required": ["action"],
@@ -93,11 +95,11 @@ _HELP_TEXT = """\
 
 Subcommands:
   list                       List recent tasks in the Duet/Duffy queue
-  add <instruction>          Enqueue a new autonomous background task
+  add <instruction>          Enqueue a new autonomous background task (approved)
   show <id>                  Show detailed summary and logs for task #<id>
   approve <id>               Approve a task paused at a Human-in-the-Loop gate
   reject <id>                Reject/cancel a task
-  retry <id>                 Re-queue a failed or rejected task
+  retry <id>                 Re-queue a failed or rejected task as approved
   swarm                      Show Ruflo multi-agent swarm & agent pool status
 """
 
@@ -112,12 +114,16 @@ def _handle_duet_tool(args: Optional[Dict[str, Any]] = None, **_: Any) -> str:
         if not title:
             return json.dumps({"ok": False, "error": "Missing 'title' for action='add'."})
         category = str(params.get("category") or "general").strip()
-        tid = store.add_task(title=title, category=category)
+        # Tasks added via the agent model enter awaiting_approval for human safety
+        tid = store.add_task(title=title, category=category, status="awaiting_approval")
         return json.dumps({
             "ok": True,
             "task_id": tid,
-            "status": "pending",
-            "message": f"Task #{tid} added to Duet/Duffy queue.",
+            "status": "awaiting_approval",
+            "message": (
+                f"Task #{tid} added to queue and is awaiting human operator approval before execution. "
+                f"The operator can approve it via '/duffy approve {tid}' or the web dashboard."
+            ),
         })
 
     if action == "list":
@@ -134,17 +140,11 @@ def _handle_duet_tool(args: Optional[Dict[str, Any]] = None, **_: Any) -> str:
             return json.dumps({"ok": False, "error": f"Task #{tid} not found."})
         return json.dumps({"ok": True, "task": detail}, ensure_ascii=False)
 
-    if action == "approve":
-        ok = store.set_status(tid, "approved", "Approved by operator via duet_queue tool.")
-        return json.dumps({"ok": ok, "task_id": tid, "status": "approved" if ok else "not_found"})
-
-    if action == "reject":
-        ok = store.set_status(tid, "rejected", "Rejected by operator via duet_queue tool.")
-        return json.dumps({"ok": ok, "task_id": tid, "status": "rejected" if ok else "not_found"})
-
-    if action == "retry":
-        ok = store.set_status(tid, "pending", "Re-queued by operator via duet_queue tool.")
-        return json.dumps({"ok": ok, "task_id": tid, "status": "pending" if ok else "not_found"})
+    if action in ("approve", "reject", "retry"):
+        return json.dumps({
+            "ok": False,
+            "error": f"Action {action!r} is restricted to human operators via /duffy or the dashboard. Models cannot approve or retry tasks.",
+        })
 
     return json.dumps({"ok": False, "error": f"Unsupported action: {action!r}"})
 
@@ -179,17 +179,34 @@ def _handle_ruflo_tool(args: Optional[Dict[str, Any]] = None, **_: Any) -> str:
 
     if action == "swarm_start":
         obj = str(params.get("objective") or "Execute parallel multi-agent workflow").strip()
-        res = run_ruflo_command(["swarm", "start", "-o", obj])
+        res = run_ruflo_command(["swarm", "start", "-o", "--", obj])
         return json.dumps(res, ensure_ascii=False)
 
     if action == "memory_search":
         query = str(params.get("objective") or "").strip()
         if not query:
             return json.dumps({"ok": False, "error": "Missing 'objective' query for memory_search."})
-        res = run_ruflo_command(["memory", "search", query])
+        res = run_ruflo_command(["memory", "search", "--", query])
         return json.dumps(res, ensure_ascii=False)
 
     return json.dumps({"ok": False, "error": f"Unsupported ruflo_swarm action: {action!r}"})
+
+
+def _on_pre_tool_call(
+    tool_name: str = "",
+    args: Optional[Dict[str, Any]] = None,
+    task_id: str = "",
+    **_: Any,
+) -> Optional[Dict[str, Any]]:
+    """Escalate destructive or multi-agent spawning actions to human approval gate."""
+    if tool_name == "ruflo_swarm":
+        action = str((args or {}).get("action") or "").strip().lower()
+        if action in ("agent_spawn", "swarm_start"):
+            return {
+                "action": "approve",
+                "message": f"Ruflo swarm operation '{action}' will launch autonomous sub-agent/swarm processes.",
+            }
+    return None
 
 
 def _handle_duet_slash(raw_args: str) -> str:
@@ -220,8 +237,9 @@ def _handle_duet_slash(raw_args: str) -> str:
     if cmd == "add":
         if not rest:
             return "Usage: /duffy add <instruction>"
-        tid = store.add_task(title=rest, category="general")
-        return f"Added task #{tid} to Duffy/Duet queue: {rest}"
+        # Explicit operator command is approved by definition
+        tid = store.add_task(title=rest, category="general", status="approved")
+        return f"Added task #{tid} to Duffy/Duet queue (status: approved for execution): {rest}"
 
     if cmd in ("show", "approve", "reject", "retry"):
         if not rest.isdigit():
@@ -241,7 +259,7 @@ def _handle_duet_slash(raw_args: str) -> str:
                 out.append(f"\n--- Summary ---\n{detail['result_summary']}")
             return "\n".join(out)
 
-        target_map = {"approve": "approved", "reject": "rejected", "retry": "pending"}
+        target_map = {"approve": "approved", "reject": "rejected", "retry": "approved"}
         new_status = target_map[cmd]
         if store.set_status(tid, new_status, f"Operator ran /duffy {cmd} #{tid}"):
             return f"Task #{tid} status updated to '{new_status}'."
@@ -264,6 +282,10 @@ def register(ctx: Any) -> None:
         schema=_RUFLO_SWARM_SCHEMA,
         handler=_handle_ruflo_tool,
         description="Orchestrate Ruflo multi-agent swarms and specialized agents (spawn, list, stop, swarm start, memory search).",
+    )
+    ctx.register_hook(
+        "pre_tool_call",
+        _on_pre_tool_call,
     )
     ctx.register_command(
         "duet",
